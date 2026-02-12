@@ -68,48 +68,18 @@ export class MapsService {
       // Save HTML to file
       await this.saveHtml(html, destination);
 
-      const $ = cheerio.load(html);
-
-      let lat: number | null = null;
-      let lng: number | null = null;
-      let source = 'google_maps_dir';
-
-      const ogImage = $('meta[property="og:image"]').attr('content');
-      
-      if (ogImage) {
-        this.logger.debug(`og:image content: ${ogImage}`);
-        const markersMatch = ogImage.match(/markers=([^&]+)/);
-        if (markersMatch && markersMatch[1]) {
-          const markersParam = decodeURIComponent(markersMatch[1]);
-          const parts = markersParam.split('|');
-          const coordinatePairs = parts.filter(part => /^-?[0-9.]+,-?[0-9.]+$/.test(part.trim()));
-          
-          if (coordinatePairs.length > 0) {
-            const lastPair = coordinatePairs[coordinatePairs.length - 1];
-            const [latStr, lngStr] = lastPair.split(',');
-            const pLat = parseFloat(latStr);
-            const pLng = parseFloat(lngStr);
-            
-            if (!isNaN(pLat) && !isNaN(pLng)) {
-              lat = pLat;
-              lng = pLng;
-            }
-          }
-        }
-      }
-
-      const resolvedName = ($('meta[property="og:title"]').attr('content') || destination).replace(' - Google Maps', '').trim();
+      const parsed = this.extractDataFromHtml(html, destination);
 
       const result: ResolvedPlace = {
-        resolvedName,
+        resolvedName: parsed.name,
         destination,
-        lat,
-        lng,
-        source: lat ? 'google_maps_dir' : 'google_maps_no_coords',
+        lat: parsed.lat,
+        lng: parsed.lng,
+        source: parsed.source,
         url,
       };
 
-      this.logger.log(`✅ Result: "${result.resolvedName}" → (${lat}, ${lng})`);
+      this.logger.log(`✅ Result: "${result.resolvedName}" → (${result.lat}, ${result.lng}) [Source: ${result.source}]`);
       return result;
 
     } catch (error: any) {
@@ -143,6 +113,74 @@ export class MapsService {
         HttpStatus.INTERNAL_SERVER_ERROR,
       );
     }
+  }
+
+  private extractDataFromHtml(html: string, fallbackName: string): { lat: number | null, lng: number | null, name: string, source: string } {
+    let lat: number | null = null;
+    let lng: number | null = null;
+    let source = 'not_found';
+    let name = fallbackName;
+
+    // Strategy 1: Parse APP_INITIALIZATION_STATE (Most reliable for the view)
+    // Format: window.APP_INITIALIZATION_STATE=[[[zoom, lng, lat], ...]]
+    const stateMatch = html.match(/APP_INITIALIZATION_STATE=\[\[\[([-0-9.]+),([-0-9.]+),([-0-9.]+)/);
+    if (stateMatch) {
+      const pLng = parseFloat(stateMatch[2]);
+      const pLat = parseFloat(stateMatch[3]);
+      if (!isNaN(pLat) && !isNaN(pLng)) {
+        lat = pLat;
+        lng = pLng;
+        source = 'app_init_state';
+        this.logger.debug(`Found coords via APP_INITIALIZATION_STATE: ${lat}, ${lng}`);
+      }
+    }
+
+    // Strategy 2: Protobuf-style encoding (!2dLng!3dLat)
+    if (!lat || !lng) {
+      // We look for !2d (Longitude) followed by !3d (Latitude)
+      // Usually the destination coords come after a distance indicator or at the end of a !pb string
+      const pbMatches = [...html.matchAll(/!2d([-0-9.]+)!3d([-0-9.]+)/g)];
+      if (pbMatches.length > 0) {
+        // We take the last match as it usually represents the destination in a directions URL
+        const lastMatch = pbMatches[pbMatches.length - 1];
+        const pLng = parseFloat(lastMatch[1]);
+        const pLat = parseFloat(lastMatch[2]);
+        if (!isNaN(pLat) && !isNaN(pLng)) {
+          lat = pLat;
+          lng = pLng;
+          source = 'protobuf_pb';
+          this.logger.debug(`Found coords via Protobuf regex: ${lat}, ${lng}`);
+        }
+      }
+    }
+
+    // Strategy 3: Fallback Meta tags (og:image markers)
+    if (!lat || !lng) {
+      const $ = cheerio.load(html);
+      name = ($('meta[property="og:title"]').attr('content') || fallbackName).replace(' - Google Maps', '').trim();
+      
+      const ogImage = $('meta[property="og:image"]').attr('content');
+      if (ogImage) {
+        const markersMatch = ogImage.match(/markers=([^&]+)/);
+        if (markersMatch) {
+          const markersParam = decodeURIComponent(markersMatch[1]);
+          const parts = markersParam.split('|');
+          const coordPair = parts.find(p => /^-?[0-9.]+,-?[0-9.]+$/.test(p.trim()));
+          if (coordPair) {
+            const [l1, l2] = coordPair.split(',');
+            lat = parseFloat(l1);
+            lng = parseFloat(l2);
+            source = 'meta_og_image_markers';
+          }
+        }
+      }
+    } else {
+      // Just extract name if coords already found
+      const $ = cheerio.load(html);
+      name = ($('meta[property="og:title"]').attr('content') || fallbackName).replace(' - Google Maps', '').trim();
+    }
+
+    return { lat, lng, name, source };
   }
 
   private async saveHtml(content: string, name: string) {
