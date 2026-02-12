@@ -1,6 +1,8 @@
 import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
+import * as fs from 'fs/promises';
+import * as path from 'path';
 import { ResolvePlaceDto } from './dto/resolve-place.dto';
 
 interface ResolvedPlace {
@@ -62,6 +64,10 @@ export class MapsService {
       }
 
       const html = await response.text();
+      
+      // Save HTML to file
+      await this.saveHtml(html, destination);
+
       const $ = cheerio.load(html);
 
       let lat: number | null = null;
@@ -136,6 +142,20 @@ export class MapsService {
         'Internal server error while resolving place',
         HttpStatus.INTERNAL_SERVER_ERROR,
       );
+    }
+  }
+
+  private async saveHtml(content: string, name: string) {
+    const safeName = name.replace(/[^a-z0-9]/gi, '_').substring(0, 50);
+    const fileName = `${safeName}.html`;
+    const htmlDir = path.join(process.cwd(), 'html');
+    
+    try {
+      await fs.mkdir(htmlDir, { recursive: true });
+      await fs.writeFile(path.join(htmlDir, fileName), content, 'utf-8');
+      this.logger.log(`💾 HTML saved: ${fileName}`);
+    } catch (e) {
+      this.logger.warn(`Could not save HTML: ${e.message}`);
     }
   }
 }
