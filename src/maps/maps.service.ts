@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ResolvePlaceDto } from './dto/resolve-place.dto';
 import { OsmService } from './osm.service';
 import { GoogleMapsService } from './google-maps.service';
+import { GoogleGeocodingService } from './google-geocoding.service';
 
 @Injectable()
 export class MapsService {
@@ -10,24 +11,36 @@ export class MapsService {
   constructor(
     private readonly osmService: OsmService,
     private readonly googleMapsService: GoogleMapsService,
+    private readonly googleGeocodingService: GoogleGeocodingService,
   ) {}
 
   async resolvePlace(dto: ResolvePlaceDto) {
     this.logger.log(`🚀 Starting resolution for: "${dto.destination}"`);
 
-    // Try Google Maps first
+    // 1. Try Official Google Geocoding API first (Premium but limited)
+    try {
+      const officialResult = await this.googleGeocodingService.resolvePlace(dto);
+      if (officialResult) {
+        this.logger.log(`✨ Resolved via Official Google API`);
+        return officialResult;
+      }
+    } catch (e) {
+      this.logger.warn(`⚠️ Official API failed: ${e.message}`);
+    }
+
+    // 2. Try Google Maps Scraper
     try {
       const googleResult = await this.googleMapsService.resolvePlace(dto);
       if (googleResult && googleResult.lat !== null && googleResult.lng !== null) {
-        this.logger.log(`✨ Resolved via Google Maps`);
+        this.logger.log(`✨ Resolved via Google Maps Scraper`);
         return googleResult;
       }
-      this.logger.log(`⚠️ Google Maps found no coordinates.`);
+      this.logger.log(`⚠️ Google Maps Scraper found no coordinates.`);
     } catch (error) {
-      this.logger.warn(`⚠️ Google Maps error: ${error.message}`);
+      this.logger.warn(`⚠️ Google Maps Scraper error: ${error.message}`);
     }
 
-    // Fallback to OSM
+    // 3. Fallback to OSM
     this.logger.log(`🔄 Falling back to OSM...`);
     const osmResult = await this.osmService.resolvePlace(dto);
     if (osmResult) {
