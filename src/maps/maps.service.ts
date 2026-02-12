@@ -5,8 +5,9 @@ import { ResolvePlaceDto } from './dto/resolve-place.dto';
 
 interface ResolvedPlace {
   resolvedName: string;
-  lat: number;
-  lng: number;
+  destination: string;
+  lat: number | null;
+  lng: number | null;
   source: string;
   url: string;
 }
@@ -63,86 +64,46 @@ export class MapsService {
       const html = await response.text();
       const $ = cheerio.load(html);
 
-      // Try to extract coordinates from og:image meta tag
+      let lat: number | null = null;
+      let lng: number | null = null;
+      let source = 'google_maps_dir';
+
       const ogImage = $('meta[property="og:image"]').attr('content');
-
-      if (!ogImage) {
-        this.logger.error('og:image meta tag not found in HTML response');
-        throw new HttpException(
-          'Cannot resolve place: Google Maps structure changed or destination not found',
-          HttpStatus.NOT_FOUND,
-        );
+      
+      if (ogImage) {
+        this.logger.debug(`og:image content: ${ogImage}`);
+        const markersMatch = ogImage.match(/markers=([^&]+)/);
+        if (markersMatch && markersMatch[1]) {
+          const markersParam = decodeURIComponent(markersMatch[1]);
+          const parts = markersParam.split('|');
+          const coordinatePairs = parts.filter(part => /^-?[0-9.]+,-?[0-9.]+$/.test(part.trim()));
+          
+          if (coordinatePairs.length > 0) {
+            const lastPair = coordinatePairs[coordinatePairs.length - 1];
+            const [latStr, lngStr] = lastPair.split(',');
+            const pLat = parseFloat(latStr);
+            const pLng = parseFloat(lngStr);
+            
+            if (!isNaN(pLat) && !isNaN(pLng)) {
+              lat = pLat;
+              lng = pLng;
+            }
+          }
+        }
       }
 
-      this.logger.debug(`og:image content: ${ogImage}`);
-
-      // Extract coordinates from markers parameter
-      // Google Maps returns multiple markers: origin|destination1|destination2...
-      // We need the LAST marker which is the actual destination
-      // Pattern: markers=lat1,lng1|lat2,lng2|lat3,lng3
-
-      // First, extract the markers parameter value
-      const markersMatch = ogImage.match(/markers=([^&]+)/);
-
-      if (!markersMatch || !markersMatch[1]) {
-        this.logger.error('No markers parameter found in og:image');
-        throw new HttpException(
-          'Markers parameter not found in Google Maps response',
-          HttpStatus.NOT_FOUND,
-        );
-      }
-
-      const markersParam = decodeURIComponent(markersMatch[1]);
-      this.logger.debug(`Decoded markers param: ${markersParam}`);
-
-      // Split by | to get all coordinate pairs
-      // Format could be: "color:red|lat1,lng1|lat2,lng2" or just "lat1,lng1|lat2,lng2"
-      const parts = markersParam.split('|');
-
-      // Find all coordinate pairs (skip color/style parts)
-      const coordinatePairs = parts.filter(part => {
-        // A coordinate pair should match: number,number
-        return /^-?[0-9.]+,-?[0-9.]+$/.test(part.trim());
-      });
-
-      if (coordinatePairs.length === 0) {
-        this.logger.error(`No coordinate pairs found in markers: ${markersParam}`);
-        throw new HttpException(
-          'No valid coordinates found in markers',
-          HttpStatus.NOT_FOUND,
-        );
-      }
-
-      // Get the LAST coordinate pair (destination)
-      const lastPair = coordinatePairs[coordinatePairs.length - 1];
-      this.logger.debug(`Found ${coordinatePairs.length} markers, using last one: ${lastPair}`);
-
-      const [latStr, lngStr] = lastPair.split(',');
-      const lat = parseFloat(latStr);
-      const lng = parseFloat(lngStr);
-
-      // Validate parsed coordinates
-      if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
-        this.logger.error(`Invalid parsed coordinates: lat=${lat}, lng=${lng}`);
-        throw new HttpException(
-          'Invalid destination coordinates',
-          HttpStatus.INTERNAL_SERVER_ERROR,
-        );
-      }
-
-      // Extract resolved name from og:title
-      const resolvedName = $('meta[property="og:title"]').attr('content') || destination;
+      const resolvedName = ($('meta[property="og:title"]').attr('content') || destination).replace(' - Google Maps', '').trim();
 
       const result: ResolvedPlace = {
-        resolvedName: resolvedName.trim(),
+        resolvedName,
+        destination,
         lat,
         lng,
-        source: 'google_maps_dir',
+        source: lat ? 'google_maps_dir' : 'google_maps_no_coords',
         url,
       };
 
-      this.logger.log(`✅ Successfully resolved: "${result.resolvedName}" → (${lat}, ${lng})`);
-
+      this.logger.log(`✅ Result: "${result.resolvedName}" → (${lat}, ${lng})`);
       return result;
 
     } catch (error: any) {
