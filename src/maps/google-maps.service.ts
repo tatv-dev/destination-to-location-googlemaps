@@ -65,21 +65,92 @@ export class GoogleMapsService {
 
       const html = await response.text();
       
-      // Save HTML to file
+      // Save HTML for debugging
       await this.saveHtml(html, destination);
+      
+      const $ = cheerio.load(html);
 
-      const parsed = this.extractDataFromHtml(html, destination);
+      // Try to extract coordinates from og:image meta tag
+      const ogImage = $('meta[property="og:image"]').attr('content');
+
+      if (!ogImage) {
+        this.logger.error('og:image meta tag not found in HTML response');
+        throw new HttpException(
+          'Cannot resolve place: Google Maps structure changed or destination not found',
+          HttpStatus.NOT_FOUND,
+        );
+      }
+
+      this.logger.debug(`og:image content: ${ogImage}`);
+
+      // Extract coordinates from markers parameter
+      // Google Maps returns multiple markers: origin|destination1|destination2...
+      // We need the LAST marker which is the actual destination
+      // Pattern: markers=lat1,lng1|lat2,lng2|lat3,lng3
+
+      // First, extract the markers parameter value
+      const markersMatch = ogImage.match(/markers=([^&]+)/);
+
+      if (!markersMatch || !markersMatch[1]) {
+        this.logger.error('No markers parameter found in og:image');
+        throw new HttpException(
+          'Markers parameter not found in Google Maps response',
+          HttpStatus.NOT_FOUND,
+        );
+      }
+
+      const markersParam = decodeURIComponent(markersMatch[1]);
+      this.logger.debug(`Decoded markers param: ${markersParam}`);
+
+      // Split by | to get all coordinate pairs
+      // Format could be: "color:red|lat1,lng1|lat2,lng2" or just "lat1,lng1|lat2,lng2"
+      const parts = markersParam.split('|');
+
+      // Find all coordinate pairs (skip color/style parts)
+      const coordinatePairs = parts.filter(part => {
+        // A coordinate pair should match: number,number
+        return /^-?[0-9.]+,-?[0-9.]+$/.test(part.trim());
+      });
+
+      if (coordinatePairs.length === 0) {
+        this.logger.error(`No coordinate pairs found in markers: ${markersParam}`);
+        throw new HttpException(
+          'No valid coordinates found in markers',
+          HttpStatus.NOT_FOUND,
+        );
+      }
+
+      // Get the LAST coordinate pair (destination)
+      const lastPair = coordinatePairs[coordinatePairs.length - 1];
+      this.logger.debug(`Found ${coordinatePairs.length} markers, using last one: ${lastPair}`);
+
+      const [latStr, lngStr] = lastPair.split(',');
+      const lat = parseFloat(latStr);
+      const lng = parseFloat(lngStr);
+
+      // Validate parsed coordinates
+      if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+        this.logger.error(`Invalid parsed coordinates: lat=${lat}, lng=${lng}`);
+        throw new HttpException(
+          'Invalid destination coordinates',
+          HttpStatus.INTERNAL_SERVER_ERROR,
+        );
+      }
+
+      // Extract resolved name from og:title
+      const resolvedName = ($('meta[property="og:title"]').attr('content') || destination).replace(' - Google Maps', '').trim();
 
       const result: ResolvedPlace = {
-        resolvedName: parsed.name,
+        resolvedName,
         destination,
-        lat: parsed.lat,
-        lng: parsed.lng,
-        source: parsed.source,
+        lat,
+        lng,
+        source: 'google_maps_dir',
         url,
       };
 
-      this.logger.log(`✅ Result: "${result.resolvedName}" → (${result.lat}, ${result.lng}) [Source: ${result.source}]`);
+      this.logger.log(`✅ Successfully resolved: "${result.resolvedName}" → (${lat}, ${lng})`);
+
       return result;
 
     } catch (error: any) {
@@ -113,74 +184,6 @@ export class GoogleMapsService {
         HttpStatus.INTERNAL_SERVER_ERROR,
       );
     }
-  }
-
-  private extractDataFromHtml(html: string, fallbackName: string): { lat: number | null, lng: number | null, name: string, source: string } {
-    let lat: number | null = null;
-    let lng: number | null = null;
-    let source = 'not_found';
-    let name = fallbackName;
-
-    // Strategy 1: Parse APP_INITIALIZATION_STATE (Most reliable for the view)
-    // Format: window.APP_INITIALIZATION_STATE=[[[zoom, lng, lat], ...]]
-    const stateMatch = html.match(/APP_INITIALIZATION_STATE=\[\[\[([-0-9.]+),([-0-9.]+),([-0-9.]+)/);
-    if (stateMatch) {
-      const pLng = parseFloat(stateMatch[2]);
-      const pLat = parseFloat(stateMatch[3]);
-      if (!isNaN(pLat) && !isNaN(pLng)) {
-        lat = pLat;
-        lng = pLng;
-        source = 'app_init_state';
-        this.logger.debug(`Found coords via APP_INITIALIZATION_STATE: ${lat}, ${lng}`);
-      }
-    }
-
-    // Strategy 2: Protobuf-style encoding (!2dLng!3dLat)
-    if (!lat || !lng) {
-      // We look for !2d (Longitude) followed by !3d (Latitude)
-      // Usually the destination coords come after a distance indicator or at the end of a !pb string
-      const pbMatches = [...html.matchAll(/!2d([-0-9.]+)!3d([-0-9.]+)/g)];
-      if (pbMatches.length > 0) {
-        // We take the last match as it usually represents the destination in a directions URL
-        const lastMatch = pbMatches[pbMatches.length - 1];
-        const pLng = parseFloat(lastMatch[1]);
-        const pLat = parseFloat(lastMatch[2]);
-        if (!isNaN(pLat) && !isNaN(pLng)) {
-          lat = pLat;
-          lng = pLng;
-          source = 'protobuf_pb';
-          this.logger.debug(`Found coords via Protobuf regex: ${lat}, ${lng}`);
-        }
-      }
-    }
-
-    // Strategy 3: Fallback Meta tags (og:image markers)
-    if (!lat || !lng) {
-      const $ = cheerio.load(html);
-      name = ($('meta[property="og:title"]').attr('content') || fallbackName).replace(' - Google Maps', '').trim();
-      
-      const ogImage = $('meta[property="og:image"]').attr('content');
-      if (ogImage) {
-        const markersMatch = ogImage.match(/markers=([^&]+)/);
-        if (markersMatch) {
-          const markersParam = decodeURIComponent(markersMatch[1]);
-          const parts = markersParam.split('|');
-          const coordPair = parts.find(p => /^-?[0-9.]+,-?[0-9.]+$/.test(p.trim()));
-          if (coordPair) {
-            const [l1, l2] = coordPair.split(',');
-            lat = parseFloat(l1);
-            lng = parseFloat(l2);
-            source = 'meta_og_image_markers';
-          }
-        }
-      }
-    } else {
-      // Just extract name if coords already found
-      const $ = cheerio.load(html);
-      name = ($('meta[property="og:title"]').attr('content') || fallbackName).replace(' - Google Maps', '').trim();
-    }
-
-    return { lat, lng, name, source };
   }
 
   private async saveHtml(content: string, name: string) {
